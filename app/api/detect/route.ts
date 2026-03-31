@@ -6,6 +6,7 @@ const anthropic = new Anthropic({
 });
 
 const HF_API_KEY = process.env.HF_API_KEY;
+const SAPLING_API_KEY = process.env.SAPLING_API_KEY;
 
 // Query HuggingFace with retry for cold-start models (503 = loading)
 async function queryHuggingFace(
@@ -53,6 +54,37 @@ async function queryHuggingFace(
     }
   }
   return null;
+}
+
+// Query Sapling AI Detector API (free tier: 50K chars/day)
+async function querySapling(text: string): Promise<{ score: number; sentence_scores?: Array<{ sentence: string; score: number }> } | null> {
+  if (!SAPLING_API_KEY) {
+    console.error("SAPLING_API_KEY is not set");
+    return null;
+  }
+  try {
+    const response = await fetch("https://api.sapling.ai/api/v1/aidetect", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        key: SAPLING_API_KEY,
+        text: text.slice(0, 8000),
+        sent_scores: true,
+      }),
+    });
+    if (!response.ok) {
+      console.error("Sapling API error:", response.status, await response.text().catch(() => ""));
+      return null;
+    }
+    const data = await response.json();
+    return {
+      score: typeof data.score === "number" ? data.score : null,
+      sentence_scores: data.sentence_scores || [],
+    };
+  } catch (err) {
+    console.error("Sapling fetch error:", err);
+    return null;
+  }
 }
 
 // Extract AI probability score from HuggingFace response
@@ -109,30 +141,41 @@ async function claudeAnalysis(text: string) {
       messages: [
         {
           role: "user",
-          content: `You are an expert AI content detector with a strong focus on ACCURACY and avoiding false positives. Your goal is to correctly distinguish between human-written and AI-generated text.
+          content: `You are an expert AI content detector. Your goal is to accurately distinguish between human-written and AI-generated text. You must be accurate in BOTH directions — catching real AI text AND not falsely flagging human text.
 
-CRITICAL RULES FOR ACCURATE DETECTION:
-- Academic, technical, or formal writing is NOT automatically AI-generated. Humans write research papers, essays, and technical documents too.
-- Grammatical errors, awkward phrasing, and typos are STRONG indicators of human writing. AI rarely makes these mistakes.
-- Domain-specific knowledge with citations, references to specific researchers/dates/experiments suggests human authorship.
-- Inconsistent formatting, run-on sentences, and informal asides within formal text are human markers.
-- AI text tends to be unnaturally smooth, overly balanced, uses generic filler phrases, and lacks specific concrete details.
-- A text with clear personal voice, unique perspective, or imperfect structure is likely human.
+HOW TO DETECT AI-GENERATED TEXT (score 70-100%):
+- Unnaturally smooth, polished prose with no errors or rough edges
+- Consistent sentence rhythm and length throughout — lacks variation
+- Generic transitional phrases used repeatedly ("Furthermore", "Moreover", "Additionally", "It is important to note")
+- Vague generalizations and platitudes instead of specific concrete details
+- Perfectly parallel sentence structures and balanced arguments
+- Overly comprehensive coverage — hits every angle too neatly
+- Lacks personal voice, opinions, or unique perspective
+- "In today's rapidly evolving world..." and similar cliché openings
+- Every paragraph follows the same structure (topic sentence → explanation → conclusion)
 
-Signs of AI-generated text:
-- Unnaturally consistent tone and sentence rhythm throughout
-- Generic hedging phrases ("It is important to note that...", "In today's rapidly evolving world...")
-- Perfectly parallel sentence structures
-- Vague generalizations without specific examples or data
-- Smooth transitions that feel templated ("Furthermore", "Moreover", "Additionally" used repeatedly)
-- Lack of any grammatical errors or informal language in casual contexts
+HOW TO DETECT HUMAN-WRITTEN TEXT (score 0-30%):
+- Grammatical errors, typos, awkward phrasing — AI rarely makes these
+- Inconsistent tone — shifts between formal and informal
+- Run-on sentences, fragments, or unusual punctuation
+- Specific citations, dates, researcher names, and domain expertise
+- Personal anecdotes, opinions, hedging ("I think", "probably", "sort of")
+- Uneven paragraph lengths and structure
+- Tangents, digressions, or incomplete thoughts
+- Use of contractions, slang, or colloquialisms
+- Formatting inconsistencies
 
-Analyze this text carefully. Be CONSERVATIVE — when in doubt, lean toward human. Only flag as AI if you see clear, specific AI patterns.
+SCORING GUIDE:
+- 85-100%: Almost certainly AI-generated (smooth, generic, no errors, templated structure)
+- 65-84%: Likely AI (mostly smooth with minor human touches)
+- 35-64%: Mixed or uncertain
+- 15-34%: Likely human (has human markers but some polished sections)
+- 0-14%: Almost certainly human (clear errors, personal voice, specific details)
 
 Respond ONLY with this exact JSON format, no other text:
 {"ai_probability": <number 0-100>, "summary": "<one sentence assessment>", "flagged_sentences": [{"text": "<exact sentence from text>", "reason": "<brief reason why it seems AI>", "ai_score": <number 0-100>}]}
 
-Include only sentences that score above 60 as AI-like. Order by ai_score descending. If the text appears genuinely human-written, return an empty flagged_sentences array.
+Include sentences scoring above 60 as AI-like. Order by ai_score descending. If the text appears human-written, return an empty flagged_sentences array.
 
 Text: ${text.slice(0, 3000)}`,
         },
@@ -201,7 +244,7 @@ export async function POST(req: NextRequest) {
       console.error("HF_API_KEY is not set in environment variables");
     }
 
-    const [engine1, engine2, engine3, engine4, engine5, claudeResult] =
+    const [engine1, engine2, engine3, engine4, engine5, saplingResult, claudeResult] =
       await Promise.all([
         queryHuggingFace(
           "openai-community/roberta-large-openai-detector",
@@ -223,6 +266,7 @@ export async function POST(req: NextRequest) {
           "Hello-SimpleAI/chatgpt-detector-roberta",
           text
         ),
+        querySapling(text),
         claudeAnalysis(text),
       ]);
 
@@ -233,6 +277,7 @@ export async function POST(req: NextRequest) {
       console.log("Engine 3 (PirateXX) raw:", JSON.stringify(engine3));
       console.log("Engine 4 (RADAR) raw:", JSON.stringify(engine4));
       console.log("Engine 5 (ChatGPT) raw:", JSON.stringify(engine5));
+      console.log("Sapling raw:", JSON.stringify(saplingResult));
     }
 
     // Label mappings (verified via curl testing):
@@ -294,6 +339,12 @@ export async function POST(req: NextRequest) {
         raw_response: engine5 ? "received" : "no response",
       },
       {
+        name: "Sapling AI Detector",
+        ai_score: saplingResult?.score != null ? Math.round(saplingResult.score * 100) : null,
+        status: saplingResult ? "success" : "error",
+        raw_response: saplingResult ? "received" : "no response",
+      },
+      {
         name: "Linguistic Analysis (Claude)",
         ai_score: claudeResult?.ai_probability ?? null,
         status: claudeResult ? "success" : "error",
@@ -309,17 +360,26 @@ export async function POST(req: NextRequest) {
     }
 
     // Weighted consensus scoring
-    // Claude gets highest weight (3x) because it understands context and avoids false positives
-    // RADAR gets medium weight (2x) because it's adversarially trained
-    // Other HF models get lower weight (1x) because they're pattern-matchers prone to false positives
+    // Claude gets highest weight (5x) — understands context, avoids false positives on human text
+    // Sapling gets high weight (3x) — commercial-grade detector with low false positives
+    // RADAR gets medium weight (2x) — adversarially trained
+    // Other HF models get low weight (1x) — pattern-matchers prone to false positives
+    // SimpleAI gets minimal weight (0.5x) — consistently unreliable
     const engineWeights: Record<string, number> = {
-      "Linguistic Analysis (Claude)": 3,
+      "Linguistic Analysis (Claude)": 5,
+      "Sapling AI Detector": 3,
       "RADAR Detector (TrustSafeAI)": 2,
       "RoBERTa Large (OpenAI)": 1,
       "AI Text Detector (Fakespot)": 1,
       "AI Content Detector (PirateXX)": 1,
       "ChatGPT Detector (SimpleAI)": 0.5,
     };
+
+    // Trusted engines that don't get penalized for disagreeing with Claude
+    const trustedEngines = new Set([
+      "Linguistic Analysis (Claude)",
+      "Sapling AI Detector",
+    ]);
 
     // Step 1: Get Claude's score as the anchor (it understands context best)
     const claudeScore = claudeResult?.ai_probability ?? null;
@@ -333,10 +393,10 @@ export async function POST(req: NextRequest) {
       if (engine.ai_score !== null && engine.status === "success") {
         let weight = engineWeights[engine.name] ?? 1;
 
-        // If Claude responded and this is an HF model, check for disagreement
+        // Only penalize HF models for disagreeing with Claude, not Sapling
         if (
           claudeScore !== null &&
-          engine.name !== "Linguistic Analysis (Claude)"
+          !trustedEngines.has(engine.name)
         ) {
           const gap = Math.abs(engine.ai_score - claudeScore);
           if (gap > 60) {
